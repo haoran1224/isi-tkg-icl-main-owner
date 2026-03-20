@@ -44,7 +44,7 @@ if __name__ == "__main__":
             model_input, candidates = prepare_history_chain(x, search_space, args, fileChainName, global_history_quadruples)
 
             if args.model == "chatGLM":
-                predictions = predict_k_chatGLM(model_input, args)
+                predictions = predict_k_chatGLM(model_input)
             else:
                 # predictions = predict(model_input, args)
                 continue

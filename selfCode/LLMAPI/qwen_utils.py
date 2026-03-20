@@ -10,6 +10,12 @@ client = OpenAI(
     base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
 
+# 新增：专为时序知识图谱(TKG)推理设计的 System Prompt
+TKG_SYSTEM_PROMPT = """You are an expert reasoning model specialized in Temporal Knowledge Graph (TKG) forecasting and link prediction.
+Your task is to analyze historical event chains (temporal logic paths) to evaluate their relevance and sufficiency for predicting future missing links.
+Please note: In TKG forecasting, past events act as behavioral patterns, structural clues, or temporal trends, rather than strict, deterministic causal evidence. 
+Please evaluate the information based on whether it provides reasonable contextual support or logical patterns for the target query."""
+
 prompt = """
     你现在是一个时间推理模型，你需要根据给定的时间推理问题，推理出问题的答案。
     target_query = ("Manohar Parrikar", "express intent to meet", "2018/10/16")
@@ -127,7 +133,7 @@ def get_evaluation_results_QWEN(prompt, temperature=5.0, top_k=5):
     completion = client.chat.completions.create(
         model="qwen-plus",
         messages=[
-            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "system", "content": TKG_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
         logprobs=True,
@@ -149,7 +155,7 @@ def get_evaluation_results(prompt, max_retries=2):
             completion = client.chat.completions.create(
                 model="qwen-plus",
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "system", "content": TKG_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0
@@ -166,21 +172,24 @@ def get_evaluation_results(prompt, max_retries=2):
     
     return completion.choices[0].message.content
 
-def predict_k_chatGLM(prompt, args):
-    prompt = [{"role": "user", "content": prompt}]
-
+def predict_k_chatGLM(prompt, max_retries=2):
     got_result = False
-    while not got_result:
+    retries = 0
+    while not got_result and retries < max_retries:
         try:
             results = client.chat.completions.create(
                 model="qwen-plus",
-                messages=prompt,
+                messages=[
+                    {"role": "system", "content": TKG_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
                 max_tokens=4096,
                 temperature=0.0,
             )
             got_result = True
             print(results.choices[0].message.content)
         except Exception:  # pylint: disable=broad-exception-caught
+            retries += 1
             return []
 
     parsed_results = parse_results(results)

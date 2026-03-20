@@ -20,6 +20,7 @@ class HitsMetric:
     hit1: int = 0
     hit3: int = 0
     hit10: int = 0
+    mrr_sum: float = 0.0  # 累积倒数排名和
 
     def update(self, rank):
         if rank <= 1:
@@ -28,6 +29,8 @@ class HitsMetric:
             self.hit3 += 1
         if rank <= 10:
             self.hit10 += 1
+        # MRR: 1/rank
+        self.mrr_sum += 1.0 / rank
 
     def dump(self):
         return {
@@ -35,6 +38,7 @@ class HitsMetric:
             "hit1": self.hit1 / self.total,
             "hit3": self.hit3 / self.total,
             "hit10": self.hit10 / self.total,
+            "mrr": self.mrr_sum / self.total,
         }
 
 
@@ -490,6 +494,9 @@ def prepare_history_chain(x, entity_search_space, args, fileChainName, global_hi
 
         if evaluate_chain_sufficiency(evidence_chains, x):
             print(f"Early stopping at round {round} as LLM judged evidence is sufficient.")
+            print("这里需要统计各个轮次结束的次数，看一下不同的分布")
+            if round == 2:
+                print("这里可以需要进行存储，进行特殊的case分析")
             break
 
     # 根据evidence_chains，构建最后查询的prompt（包含局部历史和全局历史）
@@ -539,7 +546,7 @@ def _expand_chains_from_entity(existing_chain, entity_search_space, x, round, ar
                 print(f"Error processing relation in round {round}: {e}")
 
     # 保存当前轮次的所有评分结果到JSON文件
-    save_generated_chains_jsonl(x, round, all_generated_chains, args, output_file=fileChainName)
+    # save_generated_chains_jsonl(x, round, all_generated_chains, args, output_file=fileChainName)
 
     # 根据综合评分排序，筛选出top_k条链路
     all_generated_chains.sort(key=lambda x: x[1], reverse=True)
@@ -586,7 +593,7 @@ def _expand_chains_from_existing(evidence_chains, entity_search_space, x, round,
                 print(f"Error processing chain {future_to_chain[future]}: {e}")
 
     # 保存当前轮次的所有评分结果到JSON文件
-    save_generated_chains_jsonl(x, round, all_generated_chains, args, output_file=fileChainName)
+    # save_generated_chains_jsonl(x, round, all_generated_chains, args, output_file=fileChainName)
 
     # 根据综合评分排序，筛选出top_k条链路
     all_generated_chains.sort(key=lambda x: x[1], reverse=True)

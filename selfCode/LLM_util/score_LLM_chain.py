@@ -254,11 +254,10 @@ def get_sufficiency_prompt(evidence_chains, query):
     parts.append(f"{entity}, {relation}, to whom, on the {time}th day?\n\n")
 
     # 评估要求
-    parts.append("Based on the above historical event chains, is there sufficient and direct evidence to answer the query?\n")
-    parts.append("Please strictly output only 'YES' or 'NO' (case-insensitive).\n")
-    parts.append("- 'YES': The historical event chains contain sufficient and direct evidence to answer the query.\n")
-    parts.append("- 'NO': The historical event chains do NOT contain sufficient evidence, need more exploration.\n\n")
-    parts.append("Output only 'YES' or 'NO' without any explanation.")
+    parts.append("Based on the above historical event chains, are there enough relevant patterns or sufficient contextual clues to make a reasonable prediction for the query?\n")
+    parts.append("First, briefly explain your reasoning in 1-2 sentences. Then, explicitly output your final decision as exactly 'VERDICT: YES' or 'VERDICT: NO' on a new line.\n")
+    parts.append("- 'VERDICT: YES': The history provides enough helpful context or behavioral patterns to guess the target entity.\n")
+    parts.append("- 'VERDICT: NO': The history is too disconnected, irrelevant, or lacks necessary clues for a reasonable guess.\n")
 
     return ''.join(parts)
 
@@ -281,7 +280,7 @@ def evaluate_chain_sufficiency(chains, query):
 
         # 检查结果中是否包含 "YES"（忽略大小写）
         if result and isinstance(result, str):
-            return "YES" in result.upper()
+            return "VERDICT: YES" in result.upper()
 
         return False
     except Exception as e:
