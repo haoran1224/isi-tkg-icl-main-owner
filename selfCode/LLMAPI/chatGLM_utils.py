@@ -6,13 +6,13 @@ from zai import ZhipuAiClient
 import os
 
 # 获取当前脚本所在目录，构建绝对路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-config_path = os.path.join(current_dir, "zhipuai_config.json")
+# current_dir = os.path.dirname(os.path.abspath(__file__))
+# config_path = os.path.join(current_dir, "zhipuai_config.json")
+#
+# with open(config_path, encoding="utf-8") as f:
+#     config = json.load(f)
 
-with open(config_path, encoding="utf-8") as f:
-    config = json.load(f)
-
-client = ZhipuAiClient(api_key=config["zhipuai_api_key"])
+client = ZhipuAiClient(api_key="bee7c279ea6244bdbabb02ea91d15e48.AbOqkYclQ0jACgQs")
 
 
 def parse_results(result):

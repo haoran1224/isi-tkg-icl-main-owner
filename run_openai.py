@@ -1,7 +1,7 @@
 import torch
 from tqdm import tqdm
 
-from selfCode.LLMAPI.chatGLM_utils import predict, predict_k_chatGLM
+from selfCode.LLMAPI.qwen_utils import predict_k_chatGLM
 from utils import (
     HitsMetric,
     adjust_top_k,
@@ -11,6 +11,7 @@ from utils import (
     update_history,
     update_metric,
     write_results, prepare_history_chain, get_chain_filename,
+    retrieve_global_history_facts,
 )
 
 if __name__ == "__main__":
@@ -36,12 +37,17 @@ if __name__ == "__main__":
             else:
                 raise ValueError
 
-            model_input, candidates = prepare_history_chain(x, search_space, args, fileChainName)
+            # 大模型自主控制的历史检索模块
+            # 先检索全局历史事实：在所有历史上发生的s-r都一致的四元组
+            global_history_quadruples = retrieve_global_history_facts(x, search_space, args)
+            # 准备历史事件链，同时传入全局历史四元组，将在内部正确整合局部-全局历史
+            model_input, candidates = prepare_history_chain(x, search_space, args, fileChainName, global_history_quadruples)
 
             if args.model == "chatGLM":
                 predictions = predict_k_chatGLM(model_input, args)
             else:
-                predictions = predict(model_input, args)
+                # predictions = predict(model_input, args)
+                continue
 
             update_history(x, search_space, predictions, candidates, args)
 

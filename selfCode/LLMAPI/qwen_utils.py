@@ -166,6 +166,40 @@ def get_evaluation_results(prompt, max_retries=2):
     
     return completion.choices[0].message.content
 
+def predict_k_chatGLM(prompt, args):
+    prompt = [{"role": "user", "content": prompt}]
+
+    got_result = False
+    while not got_result:
+        try:
+            results = client.chat.completions.create(
+                model="qwen-plus",
+                messages=prompt,
+                max_tokens=4096,
+                temperature=0.0,
+            )
+            got_result = True
+            print(results.choices[0].message.content)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return []
+
+    parsed_results = parse_results(results)
+    return parsed_results
+
+def parse_results(result):
+    return_text = result.choices[0].message.content
+    to_return = return_text.split('\n')
+    # 遍历所有行，只处理以数字+点+空格开头的行
+    results = []
+    for line in to_return:
+        line = line.strip()
+        if line and '. ' in line:
+            # 检查行是否以数字+点+空格开头
+            parts = line.split('. ', 1)
+            if len(parts) > 1 and parts[0].isdigit():
+                results.append(parts[1])
+    return results
+
 
 if __name__ == "__main__":
     # 配置参数
@@ -173,13 +207,13 @@ if __name__ == "__main__":
     TOP_K = 5  # Top-K截断值，与API返回的top_logprobs保持一致
 
     completion = client.chat.completions.create(
-        model="qwen-plus",
+        model="qwen3.5-plus",
         messages=[
             {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt2},
+            {"role": "user", "content":"介绍一下你自己"},
         ],
-        logprobs=True,
-        top_logprobs=TOP_K  # 与TOP_K参数保持一致
+        # logprobs=True,
+        # top_logprobs=TOP_K  # 与TOP_K参数保持一致
     )
     # --- 如何解析数据 ---
     choice = completion.choices[0]

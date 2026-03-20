@@ -1,14 +1,15 @@
 import argparse
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import random
 import json
 
-from .selfCode.LLM_util.score_LLM_chain import prune_relation_set, prune_quadruples_score_set
+from selfCode.LLM_util.score_LLM_chain import prune_relation_set, prune_quadruples_score_set
 from typing import Any, Dict, List, Optional
 
-from .selfCode.save_chain_json.save_chain_hostory import save_generated_chains_jsonl
+from selfCode.save_chain_json.save_chain_hostory import save_generated_chains_jsonl
 
 MAX_HITS = 10
 
@@ -93,7 +94,7 @@ def get_args():
         type=str,
         default="none",
     )
-    parser.add_argument("--max_rounds", default=1, type=int)  # 多轮迭代的轮次
+    parser.add_argument("--max_rounds", default=2, type=int)  # 多轮迭代的轮次
 
     args = parser.parse_args()
     assert args.label or not args.no_entity
@@ -449,13 +450,14 @@ def get_entity_edges_before_time(entity_search_space, entity, time, length):
     return selected_quadruples, list(relations)
 
 
-def prepare_history_chain(x, entity_search_space, args, fileChainName):
+def prepare_history_chain(x, entity_search_space, args, fileChainName, global_history_quadruples=None):
     """
     准备历史事件链，集成关系和实体剪枝功能
     参数:
     x: 查询四元组，格式为 [subject, relation, target, time]
     entity_search_space: 实体搜索空间字典
     args: 配置参数
+    global_history_quadruples: 全局历史四元组列表，可选
     """
     entity, relation, time = x[0], x[1], x[3]
     # 1.进行第一轮问询，使用关系+实体剪枝初始化事件链
@@ -464,10 +466,10 @@ def prepare_history_chain(x, entity_search_space, args, fileChainName):
     # 2.进行多轮问询，根据evidence_chains，进行事件发展链的构建
     # 调用外部的扩展事件链函数，支持多轮问询
     if args.max_rounds >= 1:
-        evidence_chains = expand_event_chain(evidence_chains, entity_search_space, x, args)
+        evidence_chains = expand_event_chain(evidence_chains, entity_search_space, x, args, fileChainName)
 
-    # 3.根据evidence_chains，构建最后查询的prompt
-    last_query_prompt = get_last_query_prompt(evidence_chains, x)
+    # 3.根据evidence_chains，构建最后查询的prompt（包含局部历史和全局历史）
+    last_query_prompt = get_last_query_prompt(evidence_chains, x, global_history_quadruples)
 
     if entity not in entity_search_space:
         entity_search_space[entity] = {}
@@ -530,16 +532,6 @@ def update_metric(example, metric, args):
                 print(f"target: {target} --> rank: {rank}")
             metric.update(rank)
 
-
-def calculate_first_chain_time_score(quad, query_time):
-    # 计算初始四元组与查询时间的时间差评分
-    # 时间差越小，评分越高，范围0-1
-    time_diff = abs(quad[3] - query_time)
-    # 使用与calculate_chain_score相同的衰减函数
-    initial_score = 1.0 / (1.0 + time_diff) if time_diff > 0 else 1.0
-
-    return initial_score
-
 def get_chain_filename(args: argparse.Namespace):
     model_name = args.model.split("/")[-1]
     filename_args = "_".join(
@@ -582,18 +574,19 @@ def _process_relation_for_init(pruned_rel, quadruples, x, query_time, relation_s
         quad_score = quadruple_scores_dict.get(tuple(quad), 0.5)
 
         # 计算时序评分（使用现有的calculate_chain_score函数，仅考虑时序维度）
-        time_score = calculate_first_chain_time_score(quad, query_time)
+        time_score = calculate_step_time_score(quad[3], query_time)
 
-        # # 计算逻辑规则分数
-        # Logic_score = get_chain_TLogic_score([quad], x)
 
         # 计算综合评分：关系分数 * 四元组分数 * 时序评分
-        # combined_score = rel_score * quad_score * time_score * Logic_score
-        combined_score = rel_score * quad_score * time_score
+        # 计算当前步的原始乘积得分 (限制最小值为 1e-5 防止 log(0) 报错)
+        step_prob = max(rel_score * quad_score * time_score, 1e-5)
+        log_score_sum = math.log(step_prob)
+        length_penalty = math.pow(1.0, 0.7)  # alpha = 0.7 是经典的长度惩罚系数
+        combined_score = log_score_sum / length_penalty
 
         # 存储生成的链路及其综合评分
         relation_chains.append(
-            ([quad], combined_score, f"round0_{pruned_rel}_{quad[2]}", quad_score, time_score, rel_score, 0))
+            ([quad], combined_score, f"round0_{pruned_rel}_{quad[2]}", quad_score, time_score, rel_score, log_score_sum))
 
     return relation_chains
 
@@ -633,7 +626,7 @@ def initialize_evidence_chains(x, entity_search_space, args, fileChainName):
     # 构建初始事件发展链，添加评分属性
     evidence_chains = {}
     for idx, chain_item in enumerate(top_chains):
-        chain, combined_score, chain_id, quad_score, time_score, rel_score, logic_score = chain_item
+        chain, combined_score, chain_id, quad_score, time_score, rel_score, log_score_sum = chain_item
         # 修改evidence_chains数据结构，添加评分属性
         evidence_chains[chain_id] = {
             "chain": chain,
@@ -641,7 +634,7 @@ def initialize_evidence_chains(x, entity_search_space, args, fileChainName):
             "time_score": time_score,
             "rel_score": rel_score,
             "quad_score": quad_score,
-            "logic_score": logic_score
+            "logic_score": log_score_sum
         }
 
     return evidence_chains
@@ -701,12 +694,21 @@ def _process_chain_item(chain_id, chain_data, round, entity_search_space, x):
             # 计算时序评分（使用现有的calculate_chain_score函数）
             temp_chain = chain.copy()
             temp_chain.append(quad)
-            time_score = calculate_chain_score(temp_chain)
-            # TODO:可以考虑在这里加入对链子的评分
-            # Logic_score = get_chain_TLogic_score(temp_chain, x)
-            # 计算综合评分：关系分数 * 四元组分数 * 时序评分
-            # combined_score = rel_score * quad_score * time_score * Logic_score
-            combined_score = rel_score * quad_score * time_score
+            time_score = calculate_step_time_score(quad[3], last_time)
+
+            step_prob = max(rel_score * quad_score * time_score, 1e-5)
+            step_log_score = math.log(step_prob)
+
+            parent_log_score_sum = chain_data.get("log_score_sum", math.log(max(chain_data["score"], 1e-5)))
+            current_log_score_sum = parent_log_score_sum + step_log_score
+
+            # 4. 长度惩罚机制
+            new_chain_length = len(chain) + 1
+            alpha = 0.7  # 惩罚系数
+            length_penalty = math.pow(new_chain_length, alpha)
+
+            # 计算最终用于对比的归一化综合评分
+            combined_score = current_log_score_sum / length_penalty
 
             # 创建唯一的事件链ID，避免冲突
             new_chain_id = f"{chain_id}_round{round}_rel{pruned_rel}_quad{quad_idx}"
@@ -716,12 +718,12 @@ def _process_chain_item(chain_id, chain_data, round, entity_search_space, x):
 
             # 存储生成的链路及其综合评分
             chain_generated_chains.append(
-                (new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, 0))
+                (new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, current_log_score_sum))
     return chain_generated_chains
 
 
 # 扩展事件链，支持多轮问询
-def expand_event_chain(evidence_chains, entity_search_space, x, args):
+def expand_event_chain(evidence_chains, entity_search_space, x, args, fileChainName):
     for round in range(args.max_rounds):
         # 复制当前的事件链字典，避免在迭代过程中修改
         current_chains = evidence_chains.copy()
@@ -745,7 +747,7 @@ def expand_event_chain(evidence_chains, entity_search_space, x, args):
                 except Exception as e:
                     print(f"Error processing chain {future_to_chain[future]}: {e}")
         # 保存当前轮次的所有评分结果到JSON文件
-        save_generated_chains_jsonl(x, round + 1, all_generated_chains, args)
+        save_generated_chains_jsonl(x, round + 1, all_generated_chains, args, output_file=fileChainName)
 
         # 根据综合评分排序，筛选出topn条链路
         all_generated_chains.sort(key=lambda x: x[1], reverse=True)
@@ -753,14 +755,14 @@ def expand_event_chain(evidence_chains, entity_search_space, x, args):
         top_chains = all_generated_chains[:args.top_k]
 
         # 将筛选后的链路添加到事件链字典中
-        for new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, logic_score in top_chains:
+        for new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, log_score_sum in top_chains:
             evidence_chains[new_chain_id] = {
                 "chain": new_chain,
                 "score": combined_score,
                 "time_score": time_score,
                 "rel_score": rel_score,
                 "quad_score": quad_score,
-                "logic_score": logic_score
+                "logic_score": log_score_sum
             }
 
         # 如果当前轮次没有新的链，提前结束扩展
@@ -771,36 +773,69 @@ def expand_event_chain(evidence_chains, entity_search_space, x, args):
     return evidence_chains
 
 
-def calculate_chain_score(chain):
-    if len(chain) <= 1:
+
+def retrieve_global_history_facts(x, entity_search_space, args):
+    """
+    检索全局历史事实：在所有历史上发生的s-r都一致的四元组
+
+    参数:
+    x: 查询四元组，格式为 [subject, relation, target, time]
+    entity_search_space: 实体搜索空间字典
+    args: 配置参数
+
+    返回:
+    全局历史四元组列表，格式为 [[s, r, o, t], ...]
+    """
+    subject, relation, query_time = x[0], x[1], x[3]
+
+    # 存储所有匹配的全局历史四元组
+    global_quadruples = []
+
+    # 遍历搜索空间中的所有实体
+    for entity in entity_search_space:
+        # 遍历该实体的所有时间戳
+        for time in entity_search_space[entity]:
+            # 只考虑早于查询时间的历史
+            if time >= query_time:
+                continue
+
+            # 检查是否存在与查询关系相同的关系
+            if relation in entity_search_space[entity][time]:
+                # 获取所有目标实体
+                for target in entity_search_space[entity][time][relation]:
+                    global_quadruples.append([entity, relation, target, time])
+
+    # 按时间从新到旧排序
+    global_quadruples.sort(key=lambda quad: quad[3], reverse=True)
+
+    # 限制全局历史的数量，避免prompt过长
+    max_global_facts = getattr(args, 'global_history_len', 20)
+    global_quadruples = global_quadruples[:max_global_facts]
+
+    return global_quadruples
+
+
+def calculate_step_time_score(current_time, prev_time, time_scale=100.0):
+    """
+    计算单步的时间衰减分数 (适用于单跳)。
+    采用带有下限的指数衰减，防止时间跨度过大时分数直接归零。
+    参数:
+    - time_scale: 时间缩放因子，可根据您的数据集时间单位(天/小时)进行调整。
+    """
+    time_diff = abs(prev_time - current_time)
+    if time_diff <= 0:
         return 1.0
+    # 设定 0.4 的基础保底分，剩余 0.6 随时间差平滑衰减
+    return 0.4 + 0.6 * math.exp(-time_diff / time_scale)
 
-    total_score = 0.0
-    for i in range(1, len(chain)):
-        # 获取当前四元组和前一个四元组的时间
-        current_time = chain[i][3]
-        prev_time = chain[i - 1][3]
-
-        # 计算时间差（注意：时间是从大到小排序的，所以前一个时间应该大于当前时间）
-        time_diff = prev_time - current_time
-
-        # 计算时间差评分，时间差越小评分越高
-        # 使用指数衰减函数：score = e^(-time_diff/100)，可以根据需要调整衰减系数
-        diff_score = 1.0 / (1.0 + time_diff) if time_diff > 0 else 1.0
-        total_score += diff_score
-
-    # 计算平均评分
-    avg_score = total_score / (len(chain) - 1)
-    return avg_score
-
-
-def get_last_query_prompt(evidence_chains, x):
+def get_last_query_prompt(evidence_chains, x, global_history_quadruples=None):
     """
     将历史发展链路转换为大语言模型的prompt，用于最终查询预测
 
     参数:
     evidence_chains: 历史发展链路字典，每个值包含chain和score属性
     x: 查询四元组，格式为 [subject, relation, target, time]
+    global_history_quadruples: 全局历史四元组列表，格式为 [[s, r, o, t], ...]，可选
 
     返回:
     格式化的prompt字符串
@@ -820,7 +855,7 @@ def get_last_query_prompt(evidence_chains, x):
     # 历史事件部分
     parts.append("Here are the given historical events:\n")
 
-    # 遍历所有历史发展链路中的四元组
+    # 遍历所有历史发展链路中的四元组（局部历史）
     # 按评分排序事件链，优先使用评分高的事件链
     sorted_chains = sorted(evidence_chains.items(), key=lambda item: item[1]["score"], reverse=True)
 
@@ -830,6 +865,14 @@ def get_last_query_prompt(evidence_chains, x):
         for link in chain:
             subject, relation, obj, time = link
             parts.append(f"{subject}, {relation}, {obj}, on the {time}th day; ")
+        parts.append("\n")
+
+    # 添加全局历史事实（如果有）
+    if global_history_quadruples:
+        parts.append("\nGlobal Historical Facts (consistent subject-relation patterns):\n")
+        for quad in global_history_quadruples:
+            s, r, o, t = quad
+            parts.append(f"{s}, {r}, {o}, on the {t}th day; ")
         parts.append("\n")
 
     # 移除末尾多余的空格和分号
