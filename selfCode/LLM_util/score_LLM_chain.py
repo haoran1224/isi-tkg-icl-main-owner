@@ -217,5 +217,75 @@ def parse_relation_scores(result_str):
     return scores_list
 
 
+def get_sufficiency_prompt(evidence_chains, query):
+    """
+    生成评估历史链路是否充分的 Prompt
+
+    参数:
+    evidence_chains: 事件链字典，格式为 {chain_id: {"chain": [[s, r, o, t], ...], "score": float, ...}}
+    query: 查询四元组，格式为 [subject, relation, target, time]
+
+    返回:
+    格式化的 prompt 字符串
+    """
+    entity, relation, time = query[0], query[1], query[3]
+
+    parts = []
+
+    # 任务描述
+    parts.append("You are given multiple historical event chains and a query.\n\n")
+
+    # 按评分排序事件链
+    sorted_chains = sorted(evidence_chains.items(), key=lambda x: x[1]["score"], reverse=True)
+
+    # 历史事件链部分
+    parts.append("Historical event chains (sorted by relevance score):\n")
+    for idx, (chain_id, chain_data) in enumerate(sorted_chains, start=1):
+        chain = chain_data["chain"]
+        score = chain_data["score"]
+        parts.append(f"Chain {idx} (score: {score:.4f}):\n")
+        for link in chain:
+            subject, rel, obj, t = link
+            parts.append(f"  {subject}, {rel}, {obj}, on the {t}th day\n")
+        parts.append("\n")
+
+    # 查询部分
+    parts.append("Query:\n")
+    parts.append(f"{entity}, {relation}, to whom, on the {time}th day?\n\n")
+
+    # 评估要求
+    parts.append("Based on the above historical event chains, is there sufficient and direct evidence to answer the query?\n")
+    parts.append("Please strictly output only 'YES' or 'NO' (case-insensitive).\n")
+    parts.append("- 'YES': The historical event chains contain sufficient and direct evidence to answer the query.\n")
+    parts.append("- 'NO': The historical event chains do NOT contain sufficient evidence, need more exploration.\n\n")
+    parts.append("Output only 'YES' or 'NO' without any explanation.")
+
+    return ''.join(parts)
+
+
+def evaluate_chain_sufficiency(chains, query):
+    """
+    评估历史链路是否包含足够信息来回答查询
+    参数:
+    chains: 事件链字典，格式为 {chain_id: {"chain": [[s, r, o, t], ...], "score": float, ...}}
+    query: 查询四元组，格式为 [subject, relation, target, time]
+    返回:
+    True: 如果 LLM 认为信息充足 False: 如果 LLM 认为信息不足
+    """
+    try:
+        # 生成评估 prompt
+        prompt = get_sufficiency_prompt(chains, query)
+
+        # 调用 LLM 获取评估结果
+        result = get_evaluation_results(prompt)
+
+        # 检查结果中是否包含 "YES"（忽略大小写）
+        if result and isinstance(result, str):
+            return "YES" in result.upper()
+
+        return False
+    except Exception as e:
+        print(f"Error in evaluate_chain_sufficiency: {e}")
+        return False
 
 
