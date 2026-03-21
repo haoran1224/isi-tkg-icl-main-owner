@@ -13,6 +13,13 @@ from selfCode.save_chain_json.save_chain_hostory import save_generated_chains_js
 
 MAX_HITS = 10
 
+# 轮次统计全局变量
+round_statistics = {
+    "total_queries": 0,
+    "round_distribution": {},  # {round_num: count}
+    "round2_samples": []  # 存储结束轮次为2的样本详情
+}
+
 
 @dataclass
 class HitsMetric:
@@ -476,31 +483,36 @@ def prepare_history_chain(x, entity_search_space, args, fileChainName, global_hi
     # 统一处理所有轮次：第一轮初始化 + max_rounds轮扩展
     total_rounds = args.max_rounds + 1  # 第一轮(初始化) + 扩展轮次
 
-    for round in range(total_rounds):
-        if round == 0:
+    end_round = 0  # 记录实际结束轮次
+    for round_idx in range(total_rounds):
+        if round_idx == 0:
             # 第一轮：从查询实体开始初始化事件链
             evidence_chains = _expand_chains_from_entity(
-                [], entity_search_space, x, round, args, fileChainName
+                [], entity_search_space, x, round_idx, args, fileChainName
             )
         else:
             # 多轮扩展：从现有事件链扩展
             evidence_chains = _expand_chains_from_existing(
-                evidence_chains, entity_search_space, x, round, args, fileChainName
+                evidence_chains, entity_search_space, x, round_idx, args, fileChainName
             )
+
+        # 更新结束轮次（当前轮次）
+        end_round = round_idx
 
         # 如果没有生成新的链路，提前结束
         if not evidence_chains:
             break
 
         if evaluate_chain_sufficiency(evidence_chains, x):
-            print(f"Early stopping at round {round} as LLM judged evidence is sufficient.")
-            print("这里需要统计各个轮次结束的次数，看一下不同的分布")
-            if round == 2:
-                print("这里可以需要进行存储，进行特殊的case分析")
+            print(f"Early stopping at round {round_idx} as LLM judged evidence is sufficient.")
             break
 
     # 根据evidence_chains，构建最后查询的prompt（包含局部历史和全局历史）
     last_query_prompt = get_last_query_prompt(evidence_chains, x, global_history_quadruples)
+
+    # 轮次统计：记录每个查询实例的结束轮次
+    track_round_statistics(end_round, x, evidence_chains, global_history_quadruples, args)
+
 
     if entity not in entity_search_space:
         entity_search_space[entity] = {}
@@ -842,6 +854,106 @@ def get_chain_filename(args: argparse.Namespace):
     print(f"output chain file: {filename}")
     return filename
 
+
+def track_round_statistics(end_round, x, evidence_chains, global_history_quadruples, args):
+    """
+    轮次统计函数：记录每个查询实例的结束轮次，统计各轮次分布，
+    对于结束轮次为2的样本保存局部历史和全局历史到文件
+
+    参数:
+    end_round: 实际结束的轮次
+    x: 查询四元组，格式为 [subject, relation, target, time]
+    evidence_chains: 局部历史事件链字典
+    global_history_quadruples: 全局历史四元组列表
+    args: 配置参数
+    """
+    global round_statistics
+
+    # 更新总查询数
+    round_statistics["total_queries"] += 1
+
+    # 更新轮次分布
+    if end_round not in round_statistics["round_distribution"]:
+        round_statistics["round_distribution"][end_round] = 0
+    round_statistics["round_distribution"][end_round] += 1
+
+    # 如果结束轮次为2，保存局部历史和全局历史详情
+    if end_round == 2:
+        sample_data = {
+            "query": {
+                "subject": x[0],
+                "relation": x[1],
+                "targets": x[2],
+                "time": x[3]
+            },
+            "local_history_chains": {},
+            "global_history_quadruples": global_history_quadruples if global_history_quadruples else []
+        }
+
+        # 保存局部历史（按评分排序）
+        sorted_chains = sorted(evidence_chains.items(), key=lambda item: item[1]["score"], reverse=True)
+        for chain_id, chain_data in sorted_chains:
+            sample_data["local_history_chains"][chain_id] = {
+                "chain": chain_data["chain"],
+                "score": chain_data["score"],
+                "time_score": chain_data["time_score"],
+                "rel_score": chain_data["rel_score"],
+                "quad_score": chain_data["quad_score"]
+            }
+
+        round_statistics["round2_samples"].append(sample_data)
+
+
+def print_round_statistics():
+    """
+    打印轮次统计信息
+    """
+    global round_statistics
+
+    print("\n" + "="*50)
+    print("轮次统计信息 (Round Statistics)")
+    print("="*50)
+    print(f"总查询数 (Total Queries): {round_statistics['total_queries']}")
+    print("\n各轮次分布 (Round Distribution):")
+    for round_num in sorted(round_statistics["round_distribution"].keys()):
+        count = round_statistics["round_distribution"][round_num]
+        percentage = (count / round_statistics["total_queries"] * 100) if round_statistics["total_queries"] > 0 else 0
+        print(f"  轮次 {round_num}: {count} 次 ({percentage:.2f}%)")
+    print("="*50 + "\n")
+
+
+def save_round2_samples_to_file(output_dir="outputs"):
+    """
+    将结束轮次为2的所有样本保存到文件中
+
+    参数:
+    output_dir: 输出目录
+    """
+    global round_statistics
+
+    if not round_statistics["round2_samples"]:
+        print("没有结束轮次为2的样本需要保存")
+        return
+
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 保存所有结束轮次为2的样本
+    filename = os.path.join(output_dir, "round2_samples.json")
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(round_statistics["round2_samples"], f, ensure_ascii=False, indent=2)
+    print(f"已保存 {len(round_statistics['round2_samples'])} 个结束轮次为2的样本到 {filename}")
+
+    # 单独保存轮次统计摘要
+    summary_filename = os.path.join(output_dir, "round_statistics_summary.json")
+    summary_data = {
+        "total_queries": round_statistics["total_queries"],
+        "round_distribution": round_statistics["round_distribution"],
+        "round2_samples_count": len(round_statistics["round2_samples"])
+    }
+    with open(summary_filename, 'w', encoding='utf-8') as f:
+        json.dump(summary_data, f, ensure_ascii=False, indent=2)
+    print(f"已保存轮次统计摘要到 {summary_filename}")
 
 
 def retrieve_global_history_facts(x, entity_search_space, args):

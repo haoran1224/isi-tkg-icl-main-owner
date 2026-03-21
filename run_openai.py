@@ -12,6 +12,8 @@ from utils import (
     update_metric,
     write_results, prepare_history_chain, get_chain_filename,
     retrieve_global_history_facts,
+    print_round_statistics,
+    save_round2_samples_to_file,
 )
 
 if __name__ == "__main__":
@@ -55,3 +57,18 @@ if __name__ == "__main__":
 
             update_metric(example, metric, args)
             pbar.set_postfix(metric.dump())
+
+    # 处理完所有查询后，自动进行轮次统计
+    print("\n" + "="*60)
+    print("所有查询处理完成，开始轮次统计...")
+    print("="*60)
+
+    # 打印轮次统计信息
+    print_round_statistics()
+
+    # 保存结束轮次为2的样本到文件
+    save_round2_samples_to_file()
+
+    print("="*60)
+    print("轮次统计完成！")
+    print("="*60 + "\n")
