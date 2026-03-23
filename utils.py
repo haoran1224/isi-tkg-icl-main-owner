@@ -106,6 +106,7 @@ def get_args():
         default="none",
     )
     parser.add_argument("--max_rounds", default=2, type=int)  # 多轮迭代的轮次
+    parser.add_argument("--use_llm_global", default=False, action="store_true")  # V2: 使用LLM生成全局分支描述
 
     args = parser.parse_args()
     assert args.label or not args.no_entity
@@ -476,12 +477,8 @@ def prepare_history_chain(x, entity_search_space, args, fileChainName, global_hi
     []
     """
     entity, relation, query_time = x[0], x[1], x[3]
-
-    # 初始化：第一轮从查询实体开始，链为空
     evidence_chains = {}
-
-    # 统一处理所有轮次：第一轮初始化 + max_rounds轮扩展
-    total_rounds = args.max_rounds + 1  # 第一轮(初始化) + 扩展轮次
+    total_rounds = args.max_rounds + 1
 
     end_round = 0  # 记录实际结束轮次
     for round_idx in range(total_rounds):
@@ -568,14 +565,14 @@ def _expand_chains_from_entity(existing_chain, entity_search_space, x, round, ar
     # 构建事件链字典
     evidence_chains = {}
     for chain_item in top_chains:
-        chain, combined_score, chain_id, quad_score, time_score, rel_score, log_score_sum = chain_item
+        chain, combined_score, chain_id, quad_score, time_score, rel_score, step_score = chain_item
         evidence_chains[chain_id] = {
             "chain": chain,
             "score": combined_score,
             "time_score": time_score,
             "rel_score": rel_score,
             "quad_score": quad_score,
-            "log_score_sum": log_score_sum
+            "step_score": step_score
         }
 
     return evidence_chains
@@ -614,14 +611,14 @@ def _expand_chains_from_existing(evidence_chains, entity_search_space, x, round,
     # 将筛选后的链路添加到事件链字典中
     evidence_chains.clear()
     for chain_item in top_chains:
-        new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, log_score_sum = chain_item
+        new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, step_score = chain_item
         evidence_chains[new_chain_id] = {
             "chain": new_chain,
             "score": combined_score,
             "time_score": time_score,
             "rel_score": rel_score,
             "quad_score": quad_score,
-            "log_score_sum": log_score_sum
+            "step_score": step_score
         }
 
     return evidence_chains
@@ -629,19 +626,7 @@ def _expand_chains_from_existing(evidence_chains, entity_search_space, x, round,
 
 def _process_single_relation(pruned_rel, quadruples, existing_chain, x, query_time, relation_scores_dict, round):
     """
-    处理单个关系，生成链路（第一轮和多轮通用）
-
-    参数:
-    pruned_rel: 剪枝后的关系
-    quadruples: 四元组列表
-    existing_chain: 已有的链
-    x: 查询四元组
-    query_time: 查询时间
-    relation_scores_dict: 关系评分字典
-    round: 当前轮次
-
-    返回:
-    生成的链路列表
+    处理单个关系，生成链路（第一轮）
     """
     relation_chains = []
     rel_score = relation_scores_dict.get(pruned_rel, 0.5)
@@ -667,24 +652,19 @@ def _process_single_relation(pruned_rel, quadruples, existing_chain, x, query_ti
         prev_time = query_time if not existing_chain else existing_chain[-1][3]
         time_score = calculate_step_time_score(quad[3], prev_time)
 
-        # 计算综合评分
-        step_prob = max(rel_score * quad_score * time_score, 1e-5)
-        step_log_score = math.log(step_prob)
+        # 计算综合评分：使用加权平均，保证分数为正数
+        # 关系权重40%，四元组权重40%，时序权重20%
+        w_rel, w_quad, w_time = 0.4, 0.4, 0.2
+        step_score = w_rel * rel_score + w_quad * quad_score + w_time * time_score
 
         if existing_chain:
-            # 多轮：累加父链的评分
-            parent_log_score_sum = existing_chain[-1] if isinstance(existing_chain[-1], (int, float)) else 0
-            current_log_score_sum = parent_log_score_sum + step_log_score
-            new_chain_length = len(existing_chain) + 1
+            # 多轮：当前分数与父链分数的加权平均（父链权重更高）
+            parent_score = existing_chain[-1] if isinstance(existing_chain[-1], (int, float)) else 0.5
+            w_parent, w_current = 0.6, 0.4
+            combined_score = w_parent * parent_score + w_current * step_score
         else:
-            # 第一轮：初始评分
-            current_log_score_sum = step_log_score
-            new_chain_length = 1
-
-        # 长度惩罚
-        alpha = 0.7
-        length_penalty = math.pow(new_chain_length, alpha)
-        combined_score = current_log_score_sum / length_penalty
+            # 第一轮：直接使用当前分数
+            combined_score = step_score
 
         # 生成链路ID
         if round == 0:
@@ -697,7 +677,7 @@ def _process_single_relation(pruned_rel, quadruples, existing_chain, x, query_ti
         new_chain.append(quad)
 
         relation_chains.append(
-            (new_chain, combined_score, chain_id, quad_score, time_score, rel_score, current_log_score_sum)
+            (new_chain, combined_score, chain_id, quad_score, time_score, rel_score, step_score)
         )
 
     return relation_chains
@@ -705,17 +685,7 @@ def _process_single_relation(pruned_rel, quadruples, existing_chain, x, query_ti
 
 def _process_single_chain(chain_id, chain_data, entity_search_space, x, round):
     """
-    处理单条事件链，生成新的扩展链路
-
-    参数:
-    chain_id: 事件链ID
-    chain_data: 事件链数据
-    entity_search_space: 实体搜索空间
-    x: 查询四元组
-    round: 当前轮次
-
-    返回:
-    生成的新链路列表
+    处理单条事件链，生成新的扩展链路，用于2-n轮
     """
     chain = chain_data["chain"]
 
@@ -761,19 +731,15 @@ def _process_single_chain(chain_id, chain_data, entity_search_space, x, round):
             # 计算时序评分
             time_score = calculate_step_time_score(quad[3], last_time)
 
-            # 计算综合评分
-            step_prob = max(rel_score * quad_score * time_score, 1e-5)
-            step_log_score = math.log(step_prob)
+            # 计算综合评分：使用加权平均，保证分数为正数
+            # 关系权重40%，四元组权重40%，时序权重20%
+            w_rel, w_quad, w_time = 0.4, 0.4, 0.2
+            step_score = w_rel * rel_score + w_quad * quad_score + w_time * time_score
 
-            # 累加父链的评分
-            parent_log_score_sum = chain_data.get("log_score_sum", math.log(max(chain_data["score"], 1e-5)))
-            current_log_score_sum = parent_log_score_sum + step_log_score
-
-            # 长度惩罚
-            new_chain_length = len(chain) + 1
-            alpha = 0.7
-            length_penalty = math.pow(new_chain_length, alpha)
-            combined_score = current_log_score_sum / length_penalty
+            # 多轮：当前分数与父链分数的加权平均（父链权重更高）
+            parent_score = chain_data.get("score", 0.5)
+            w_parent, w_current = 0.6, 0.4
+            combined_score = w_parent * parent_score + w_current * step_score
 
             # 生成新链路ID
             new_chain_id = f"{chain_id}_round{round}_rel{pruned_rel}_quad{quad_idx}"
@@ -783,7 +749,7 @@ def _process_single_chain(chain_id, chain_data, entity_search_space, x, round):
             new_chain.append(quad)
 
             chain_generated_chains.append(
-                (new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, current_log_score_sum)
+                (new_chain, combined_score, new_chain_id, quad_score, time_score, rel_score, step_score)
             )
 
     return chain_generated_chains
@@ -980,7 +946,7 @@ def retrieve_global_history_facts(x, entity_search_space, args):
     global_quadruples.sort(key=lambda quad: quad[3], reverse=True)
 
     # 限制全局历史的数量，避免prompt过长
-    max_global_facts = getattr(args, 'global_history_len', 20)
+    max_global_facts = getattr(args, 'global_history_len', 10)
     global_quadruples = global_quadruples[:max_global_facts]
 
     return global_quadruples

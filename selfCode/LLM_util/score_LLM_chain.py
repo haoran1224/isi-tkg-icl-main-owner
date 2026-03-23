@@ -288,3 +288,155 @@ def evaluate_chain_sufficiency(chains, query):
         return False
 
 
+# ============================================================
+# V2 版本：增强的关系剪枝函数（基于详细评估维度）
+# ============================================================
+
+def get_prune_relation_prompt_v2(relation_set, query, chain):
+    """
+    构建V2版本的关系剪枝 prompt（基于 fixPrompt.txt 的设计）
+    """
+    head_entity = query[0]
+    target_relation = query[1]
+    target_time = query[3]
+
+    parts = []
+
+    # Role
+    parts.append("Role\n\n")
+    parts.append("You are a senior international relations analyst and an expert in temporal knowledge graph (TKG) feature engineering. ")
+    parts.append("Your task is to evaluate the information value of a set of recently observed relations under a specific historical context for predicting a future target event.\n\n")
+
+    # Task Definitions
+    parts.append("Task Definitions\n")
+    parts.append(f"Target Query: Predict which tail entity will form the relation [{target_relation}] with the head entity [{head_entity}] at time [{target_time}].\n")
+    parts.append("Contextual Relation Set: The set of all relation types that [Head_Entity] has participated in within a recent historical time window prior to [Target_Time].\n\n")
+
+    # Current Context
+    parts.append("Current Context\n")
+    parts.append(f"Query to Predict: ({head_entity}, {target_relation}, ?, {target_time})\n")
+    parts.append("Recently Observed Relation Set: ")
+    parts.append(", ".join(relation_set))
+    parts.append("\n\n")
+
+    # Evaluation Criteria
+    parts.append("Evaluation Criteria\n\n")
+    parts.append("Carefully evaluate each relation in the Contextual Relation Set. You need to determine:\n\n")
+    parts.append(f"If the head entity has such a relation with a candidate country, how much predictive value does it provide for inferring the [{target_relation}]?\n\n")
+    parts.append("Please conduct a comprehensive assessment based on the following four dimensions, and assign:\n")
+    parts.append("an Information Value Score (0–10)\n")
+    # parts.append("a Polarity (Positive / Negative / Neutral)\n\n")
+
+    parts.append("1. Strong Logical Path (Local Path Relevance) [8–10 points]\n")
+    parts.append(f"Positive Correlation: The relation is a direct precursor, necessary condition, or key catalyst of the target relation [{target_relation}]\n")
+    parts.append("(e.g., for predicting \"Sign Agreement\", relations like \"Consult\" or \"Mutual Visits\" should receive very high scores).\n")
+    parts.append("Negative Correlation: The relation is strongly contradictory or destructive with respect to the target relation\n")
+    parts.append("(e.g., for predicting \"Cooperation\", relations like \"Expel\" or \"Military Conflict\" carry strong exclusionary value—high score but negative polarity).\n\n")
+
+    parts.append("2. Macro Contextual Setup (Global Evolution Context) [5–7 points]\n")
+    parts.append("The relation does not directly lead to the target event but reflects the overall diplomatic tone or strategic tendency of the head entity in the recent period\n")
+    parts.append("(e.g., \"Provide Aid\", \"Express Optimism\" help establish a cooperative atmosphere).\n\n")
+
+    parts.append("3. Weak or Ambiguous Signals [2–4 points]\n")
+    parts.append("One-sided actions without strong constraints on future developments, or relations that may lead to multiple possible outcomes in the current context\n")
+    parts.append("(e.g., \"Make Speech\", \"Symbolic Actions\").\n\n")
+
+    parts.append("4. Noise [0–1 point]\n")
+    parts.append("Overly generic, high-frequency daily interactions with low information entropy that do not help distinguish specific target entities.\n\n")
+
+    # Output Format - 简化版本：只输出关系名和分数
+    parts.append("Output Format\n\n")
+    parts.append("For each relation in the set, output ONLY the relation name and its information value score.\n\n")
+    parts.append("Format: [Relation Name]: [Score]\n\n")
+    parts.append("Example:\n")
+    parts.append("Consult: 9\n")
+    parts.append("Express_intent_to_cooperate: 7\n")
+    parts.append("Make_statement: 3\n\n")
+    parts.append("Please strictly follow the above format. Do NOT output any explanations, justifications, or additional text.\n")
+
+    return ''.join(parts)
+
+
+def parse_relation_scores_v2(result_str):
+    """
+    解析V2版本的关系评分输出（简化版：只包含关系名和分数）
+
+    输入格式：
+    Relation: Score
+
+    返回:
+    字典: {relation_name: normalized_score (0-1)}
+    """
+    if not result_str or not isinstance(result_str, str):
+        return {}
+
+    relation_scores = {}
+    lines = result_str.split('\n')
+
+    for line in lines:
+        line = line.strip()
+        if not line or ':' not in line:
+            continue
+
+        # 分割关系名和分数
+        parts = line.split(':', 1)
+        if len(parts) != 2:
+            continue
+
+        relation = parts[0].strip()
+        score_str = parts[1].strip()
+
+        # 尝试解析分数
+        try:
+            score = float(score_str)
+            # 归一化到 0-1 范围（假设输入是 0-10）
+            normalized_score = score / 10.0
+            relation_scores[relation] = normalized_score
+        except ValueError:
+            # 如果解析失败，跳过这一行
+            continue
+
+    return relation_scores
+
+
+def prune_relation_set_v2(relation_set, query, chain, top_relation=3):
+    """
+    V2 版本的关系剪枝函数（使用详细的评估维度，简化输出）
+    """
+    # 构建V2版本的 prompt
+    prompt = get_prune_relation_prompt_v2(relation_set, query, chain)
+
+    try:
+        # 调用LLM获取关系评分
+        result = get_evaluation_results(prompt)
+
+        # 解析V2格式的评分（简化版：关系名:分数）
+        relation_scores = parse_relation_scores_v2(result)
+
+        # 如果评分结果为空，返回原始关系集合的前几个
+        if not relation_scores:
+            pruned_relations = relation_set[:top_relation] if len(relation_set) > top_relation else relation_set
+            return pruned_relations, {}
+
+        # 按评分降序排序
+        relation_score_pairs = sorted(
+            relation_scores.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # 筛选前 top_k 个关系
+        # TODO：这一块可以改一下字根据阈值也可以
+        pruned_relations_with_scores = relation_score_pairs[:top_relation]
+
+        # 返回剪枝后的关系和对应的评分
+        pruned_relations = [rel for rel, score in pruned_relations_with_scores]
+        relation_scores_dict = {rel: score for rel, score in pruned_relations_with_scores}
+
+        return pruned_relations, relation_scores_dict
+
+    except Exception as e:
+        # 如果发生错误，返回原始关系集合的前几个关系
+        print(f"Error in prune_relation_set_v2: {e}")
+        pruned_relations = relation_set[:top_relation] if len(relation_set) > top_relation else relation_set
+        return pruned_relations, {}
