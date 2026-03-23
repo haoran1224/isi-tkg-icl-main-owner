@@ -57,6 +57,12 @@ if __name__ == "__main__":
 
             if args.model == "chatGLM":
                 predictions = predict_k_chatGLM(model_input)
+
+                for cand in candidates:
+                    if cand not in predictions:
+                        predictions.append(cand)
+                        if len(predictions) >= 10:  # 保证列表至少有10个以提高Hits@10
+                            break
             else:
                 # predictions = predict(model_input, args)
                 continue

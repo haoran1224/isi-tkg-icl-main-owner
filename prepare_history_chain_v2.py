@@ -397,13 +397,17 @@ def build_cot_prompt(local_branches: Dict[str, List[List[Any]]],
     # parts.append(format_global_branch_prompt(global_branch))
 
     # 局部分支
-    parts.append(format_local_branch_prompt(local_branches, max_branches=15))
+    parts.append(format_local_branch_prompt(local_branches, max_branches=20))
 
     # 查询部分
     parts.append("-" * 60 + "\n")
     parts.append("QUERY TO ANSWER:\n")
     parts.append(f"{query_subject}, {query_relation}, to whom, on the {query_time}th day?\n")
     parts.append("-" * 60 + "\n\n")
+
+    # 候选实体列表
+    parts.append("Available Candidates:\n")
+    parts.append(", ".join(candidates[:20]) + "\n\n")  # 将最可能的前20个候选告诉模型
 
     # 思维链推理要求
     parts.append("REASONING INSTRUCTIONS (Chain of Thought):\n")
@@ -445,8 +449,8 @@ def build_cot_prompt(local_branches: Dict[str, List[List[Any]]],
     # parts.append("3. South_Korea\n\n")
     # parts.append("Please strictly follow the above format for output.\n")
     # 输出要求部分
-    parts.append(
-        "Please list all possible {object} which may be answers (one per line) without explanations. Note that answers with high probability should be listed first.\n")
+    parts.append("Please explicitly list the top 10 most likely {object} entities that could answer the query, ranked by probability (one per line) without explanations.\n")
+    parts.append("including entities not mentioned in the history but logically inferred.\n")
     parts.append("For example:\n")
     parts.append("Possible answers:\n")
     parts.append("1. XXX\n")
@@ -500,15 +504,19 @@ def parse_llm_predictions(llm_output: str, candidates: List[str]) -> List[Tuple[
     return predictions
 
 
-def get_candidates_from_local_branches(local_branches: Dict[str, List[List[Any]]]) -> List[str]:
+def get_candidates_from_local_branches(
+    local_branches: Dict[str, List[List[Any]]],
+    global_history_quadruples: List[List[Any]] = None
+) -> List[str]:
     """
-    从局部分支中获取候选实体列表
+    从局部分支中获取候选实体列表，并补充全局历史中存在的实体
 
     参数:
     local_branches: 按尾实体分组的字典 {tail_entity: [(s, r, o, t), ...]}
+    global_history_quadruples: 全局历史四元组列表 [[s, r, o, t], ...]（可选）
 
     返回:
-    候选实体列表（尾实体列表）
+    候选实体列表（先局部后全局，去重）
     """
     # 按每个尾实体的四元组数量排序，返回排序后的候选实体列表
     sorted_candidates = sorted(
@@ -516,7 +524,21 @@ def get_candidates_from_local_branches(local_branches: Dict[str, List[List[Any]]
         key=lambda x: len(x[1]),
         reverse=True
     )
-    return [entity for entity, _ in sorted_candidates]
+    local_entities = [entity for entity, _ in sorted_candidates]
+
+    # 如果提供了全局历史四元组，提取其中的实体作为补充
+    if global_history_quadruples:
+        global_entities = set()
+        for quad in global_history_quadruples:
+            if len(quad) >= 3:
+                global_entities.add(quad[2])  # quad[2] 是目标实体（o）
+
+        # 添加全局历史中存在但局部历史中不存在的实体
+        for entity in global_entities:
+            if entity not in local_branches:
+                local_entities.append(entity)
+
+    return local_entities
 
 
 # ============================================================
@@ -561,12 +583,12 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
     #     initial_relations, x, [], top_relation=min(5, len(initial_relations))
     # )
     pruned_relations, relation_scores = prune_relation_set(
-        initial_relations, x, [], top_relation=min(5, len(initial_relations))
+        initial_relations, x, [], top_relation=min(8, len(initial_relations))
     )
 
     if not pruned_relations:
         # 如果没有筛选出关系，使用初始关系
-        pruned_relations = initial_relations[:5]
+        pruned_relations = initial_relations[:8]
 
     # ===== 步骤3：根据筛选得到的关系链路筛选四元组 =====
     # 获取筛选后的关系对应的四元组
@@ -594,19 +616,18 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
 
     # ===== 步骤5：全局分支 - 使用LLM生成宏观状态描述 =====
     # 获取是否使用LLM生成全局分支的参数
-    use_llm_global = getattr(args, 'use_llm_global', True)
-    global_branch = build_global_branch_with_llm(final_quadruples, x, use_llm=use_llm_global)
+    # use_llm_global = getattr(args, 'use_llm_global', True)
+    # global_branch = build_global_branch_with_llm(final_quadruples, x, use_llm=use_llm_global)
 
     # ===== 步骤6：大模型预测 - 融合全局和局部分支，使用思维链推演 =====
-    # 从局部分支中获取候选实体列表（尾实体）
-    candidates = get_candidates_from_local_branches(local_branches)
+    # 从局部分支中获取候选实体列表，并补充全局历史中的实体
+    candidates = get_candidates_from_local_branches(local_branches, global_history_quadruples)
 
     # 构建思维链prompt
-    model_input = build_cot_prompt(local_branches, global_branch, x, candidates, global_history_quadruples)
+    model_input = build_cot_prompt(local_branches, {}, x, candidates, global_history_quadruples)
 
-    # 为了保持与现有代码的兼容性，返回空列表作为candidates
     # 实际的候选实体会在LLM输出中解析得到
-    return model_input, []
+    return model_input, candidates
 
 
 # ============================================================
