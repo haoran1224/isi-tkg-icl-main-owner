@@ -90,9 +90,11 @@ def get_coh_step2_prompt(chains: List[List[List[Any]]], query: List[Any]) -> str
         for i, quad in enumerate(chain):
             s, r, o, t = quad
             if i == 0:
-                parts.append(f"  First-order fact: {s}, {r}, {o}, on the {t}th day\n")
+                # parts.append(f"  First-order fact: {s}, {r}, {o}, on the {t}th day\n")
+                parts.append(f"{s}, {r}, {o}, on the {t}th day;")
             else:
-                parts.append(f"  Related fact: {s}, {r}, {o}, on the {t}th day\n")
+                # parts.append(f"  Related fact: {s}, {r}, {o}, on the {t}th day\n")
+                parts.append(f"{s}, {r}, {o}, on the {t}th day\n")
         parts.append("\n")
 
     # Output instruction

@@ -34,6 +34,10 @@ def prepare_history_chain_coh(x, entity_search_space, args):
     """
     entity, relation, query_time = x[0], x[1], x[3]
 
+    # 新增：初始化指标统计变量
+    total_candidate_facts = 0
+    total_tokens = 0
+
     # 确保 entity_search_space 初始化（与 V2 保持一致，防止 update_history 出错）
     if entity not in entity_search_space:
         entity_search_space[entity] = {}
@@ -50,6 +54,9 @@ def prepare_history_chain_coh(x, entity_search_space, args):
         entity_search_space, entity, query_time, history_len
     )
 
+    # 统计：累加一阶检索的候选事实数
+    total_candidate_facts += len(first_order_quads)
+
     if not first_order_quads:
         prompt = f"No historical data available for {entity}. Query: {entity}, {relation}, ?, {query_time}\n"
         return prompt, []
@@ -57,6 +64,9 @@ def prepare_history_chain_coh(x, entity_search_space, args):
     # 调用 LLM 进行一阶筛选
     top_n = 30  # 阶段1筛选数量
     step1_prompt = get_coh_step1_prompt(first_order_quads, x)
+
+    # 统计：累加阶段1 Prompt 的 Token 消耗 (粗略估算)
+    total_tokens += int(len(step1_prompt.split()) * 1.3)
 
     try:
         step1_result = get_evaluation_results(step1_prompt)
@@ -76,7 +86,7 @@ def prepare_history_chain_coh(x, entity_search_space, args):
     # 阶段 2：二阶历史链构建与筛选
     # ============================================================
     second_order_limit = 5  # 每个一阶尾实体最多取 5 条二阶事实
-    chains = []  # 二维列表：每条链 = [一阶事实, 二阶事实1, 二阶事实2, ...]
+    chains = []  # 二维列表：每条链 = [一阶事实, 二阶事实]  1对1关系
 
     for quad in selected_first_order:
         tail_entity = quad[2]  # 一阶事实的尾实体
@@ -85,20 +95,28 @@ def prepare_history_chain_coh(x, entity_search_space, args):
             entity_search_space, tail_entity, query_time, second_order_limit
         )
 
-        # 构建链：[一阶事实] + [二阶事实列表]
-        chain = [quad]
+        # 统计：累加为当前尾实体检索的二阶候选事实数
+        total_candidate_facts += len(second_order_quads)
+
+        # 构建链：一阶事实与每一个二阶事实分别组成独立链路（1对1）
         if second_order_quads:
-            chain.extend(second_order_quads)
-        chains.append(chain)
+            for sq in second_order_quads:
+                chains.append([quad, sq])
+        else:
+            # 没有二阶历史时，仅保留一阶事实作为单条链
+            chains.append([quad])
 
     if not chains:
         # 极端情况：没有任何链，回退到简单 prompt
         prompt = f"No chains available for {entity}. Query: {entity}, {relation}, ?, {query_time}\n"
-        return prompt, []
+        return prompt, [], total_candidate_facts, total_tokens
 
     # 调用 LLM 进行二阶筛选
-    top_m = 15  # 阶段2筛选数量
+    top_m = 30  # 阶段2筛选数量
     step2_prompt = get_coh_step2_prompt(chains, x)
+
+    # 🌟 统计：累加阶段2 Prompt 的 Token 消耗
+    total_tokens += int(len(step2_prompt.split()) * 1.3)
 
     try:
         step2_result = get_evaluation_results(step2_prompt)
@@ -130,4 +148,7 @@ def prepare_history_chain_coh(x, entity_search_space, args):
     # 构建最终预测 Prompt
     model_input = get_coh_predict_prompt(screened_chains, x, candidates)
 
-    return model_input, candidates
+    # 🌟 统计：累加阶段3 (最终预测) Prompt 的 Token 消耗
+    total_tokens += int(len(model_input.split()) * 1.3)
+
+    return model_input, candidates, total_candidate_facts, total_tokens
