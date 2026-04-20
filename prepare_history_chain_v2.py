@@ -10,7 +10,8 @@ from typing import List, Dict, Tuple, Any
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from expand_high_hitory import evaluate_candidate_entities_globally, apply_second_order_expansion
+from expand_high_hitory import evaluate_candidate_entities_globally, apply_second_order_expansion, \
+    apply_lightweight_second_order_expansion
 from selfCode.LLMAPI.qwen_utils import get_evaluation_results
 from selfCode.LLM_util.score_LLM_chain import (
     prune_relation_set, prune_quadruples_score_set,
@@ -559,8 +560,15 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
     4) 局部分支：按尾实体分组形成一阶候选线索
     5) 全局分支：统计头实体在近期时间窗口内的关系频率
     6) 大模型预测：融合全局和局部分支，使用思维链推演
+
+    返回:
+        (model_input, candidates, total_candidate_facts, total_tokens)
     """
     entity, relation, query_time = x[0], x[1], x[3]
+
+    # 统计指标初始化
+    total_candidate_facts = 0
+    total_tokens = 0
 
     # 首先初始化 entity_search_space 以确保 update_history 不会出错
     if entity not in entity_search_space:
@@ -576,17 +584,21 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
         entity_search_space, entity, query_time, history_len
     )
 
+    # 统计：累加一阶检索的候选事实数
+    total_candidate_facts += len(initial_quadruples)
+
     if not initial_quadruples:
         prompt = f"No historical data available for {entity}. Query: {entity}, {relation}, ?, {query_time}\n"
-        return prompt, []
+        return prompt, [], 0, 0
 
     # ===== 步骤2：通过关系筛选过滤高价值历史链路（使用V2版本）=====
     # pruned_relations, relation_scores = prune_relation_set_v2(
     #     initial_relations, x, [], top_relation=min(5, len(initial_relations))
     # )
-    pruned_relations, relation_scores = prune_relation_set(
+    pruned_relations, relation_scores, prune_tokens = prune_relation_set(
         initial_relations, x, [], top_relation=min(8, len(initial_relations))
     )
+    total_tokens += prune_tokens
 
     if not pruned_relations:
         # 如果没有筛选出关系，使用初始关系
@@ -605,20 +617,28 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
     # TODO：这一块的构建和排序也是存在一些问题，需要进行一个链路累计的除法
     local_branches = build_local_branch(final_quadruples, relation_scores, query_time)
 
-    halt_branches, expand_branches, discard_entities_global = evaluate_candidate_entities_globally(local_branches, x, 15)
+    halt_branches, expand_branches, discard_entities_global, eval_tokens = evaluate_candidate_entities_globally(local_branches, x, 15)
+    total_tokens += eval_tokens
     #
     # # ===== 二阶扩展：对expand_branches中的桥梁实体进行高阶历史挖掘 =====
-    halt_branches = apply_second_order_expansion(halt_branches, expand_branches, entity_search_space, x, args, relation_scores)
+    # TODO：新写一个扩展的方法，不利用大模型了
+    # halt_branches = apply_second_order_expansion(halt_branches, expand_branches, entity_search_space, x, args, relation_scores)
+    halt_branches, expand_tokens, expand_facts = apply_lightweight_second_order_expansion(halt_branches, expand_branches, entity_search_space, x, 30)
+    total_tokens += expand_tokens
+    total_candidate_facts += expand_facts
     #
     # # ===== 步骤6：大模型预测 - 融合全局和局部分支，使用思维链推演 =====
     # candidates = get_candidates_from_local_branches(halt_branches, global_history_quadruples)
-    candidates = get_candidates_from_local_branches(local_branches, global_history_quadruples)
+    candidates = get_candidates_from_local_branches(halt_branches, global_history_quadruples)
 
     # 构建思维链prompt
     model_input = build_cot_prompt(local_branches, {}, x, candidates, global_history_quadruples)
 
+    # 统计：累加最终预测 Prompt 的 Token 消耗
+    total_tokens += int(len(model_input.split()) * 1.3)
+
     # 实际的候选实体会在LLM输出中解析得到
-    return model_input, candidates
+    return model_input, candidates, total_candidate_facts, total_tokens
 
 
 # ============================================================

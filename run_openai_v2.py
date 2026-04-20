@@ -36,6 +36,11 @@ if __name__ == "__main__":
     filename = get_filename(args)
     fileChainName = get_chain_filename(args)
 
+    # 全链路开销全局统计变量
+    global_total_facts = 0
+    global_total_tokens = 0
+    query_count = 0
+
     with torch.no_grad(), open(filename, "w", encoding="utf-8") as writer, tqdm(test_data) as pbar:
         for i, (x, direction) in enumerate(pbar):
             if i % args.world_size != args.rank:
@@ -51,9 +56,13 @@ if __name__ == "__main__":
 
 
             global_history_quadruples = retrieve_global_history_facts(x, search_space, args)
-            model_input, candidates = prepare_history_chain_v2(
+            model_input, candidates, facts_count, tokens_count = prepare_history_chain_v2(
                 x, search_space, args, fileChainName, global_history_quadruples
             )
+            # 累加统计数据
+            global_total_facts += facts_count
+            global_total_tokens += tokens_count
+            query_count += 1
 
             if args.model == "chatGLM":
                 predictions = predict_k_chatGLM(model_input)
@@ -75,14 +84,19 @@ if __name__ == "__main__":
             pbar.set_postfix(metric.dump())
 
     # 处理完所有查询后，打印统计信息
-    print("\n" + "="*60)
-    print("所有查询处理完成，开始统计...")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print("V2 全链路开销与性能统计")
+    print("=" * 60)
+    if query_count > 0:
+        avg_facts = global_total_facts / query_count
+        avg_tokens = global_total_tokens / query_count
+        print(f"总计评估查询 (Total Queries): {query_count}")
+        print(f"平均检索候选事实数 (Average Retrieved Facts/Query): {avg_facts:.2f} 条")
+        print(f"全链路总 Token 消耗量 (Total Token Consumption/Query): 约 {avg_tokens:.0f} Tokens")
+        print(metric.dump())
 
-    # 打印统计信息
-    print_round_statistics()
-    save_round2_samples_to_file()
+    # # 打印统计信息
+    # print_round_statistics()
+    # save_round2_samples_to_file()
 
-    print("="*60)
-    print("处理完成！")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")

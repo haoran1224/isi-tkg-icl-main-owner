@@ -1,6 +1,7 @@
 from typing import Dict, List, Any, Tuple
 
 from selfCode.LLMAPI.qwen_utils import get_evaluation_results
+from utils import get_entity_edges_before_time
 
 
 def evaluate_candidate_entities_globally(
@@ -36,7 +37,7 @@ def evaluate_candidate_entities_globally(
 
     # 如果没有候选实体，直接返回空结果
     if not local_branches:
-        return halt_branches, expand_branches, discard_entities
+        return halt_branches, expand_branches, discard_entities, 0
 
     # 提取所有候选实体名称（按四元组数量排序，取前 top_n）
     sorted_entities = sorted(local_branches.items(), key=lambda x: len(x[1]), reverse=True)[:top_n]
@@ -46,6 +47,7 @@ def evaluate_candidate_entities_globally(
         # 步骤1: 构建全局评估 prompt
         # 传递已排序的实体，避免在函数内部重复排序
         eval_prompt = get_global_eval_prompt(local_branches, query, top_n, sorted_entities)
+        tokens_count = int(len(eval_prompt.split()) * 1.3)
 
         # 步骤2: 调用 LLM 获取评估结果
         llm_output = get_evaluation_results(eval_prompt)
@@ -75,8 +77,9 @@ def evaluate_candidate_entities_globally(
         print(f"Error in evaluate_candidate_entities_globally: {e}")
         print("Adopting conservative strategy: routing all entities to halt_branches")
         halt_branches = local_branches.copy()
+        tokens_count = 0
 
-    return halt_branches, expand_branches, discard_entities
+    return halt_branches, expand_branches, discard_entities, tokens_count
 
 
 
@@ -808,4 +811,246 @@ def find_dynamic_time_anchor(evidence_cluster: List[List[Any]],
     return best_quad[3] if best_quad else evidence_cluster[0][3]
 
 
+# ============================================================
+# 轻量化二阶扩展 - "锚点提取 + 全局 LLM 筛选" 模块
+# ============================================================
 
+def apply_lightweight_second_order_expansion(
+    halt_branches: Dict[str, List[List[Any]]],
+    expand_branches: Dict[str, List[List[Any]]],
+    entity_search_space: Dict[str, Dict[int, Dict[str, List[str]]]],
+    query: List[Any],
+    top_n: int = 30
+) -> Dict[str, List[List[Any]]]:
+    """
+    轻量化二阶扩展：基于锚点提取 + 全局 LLM 筛选的二阶扩展逻辑
+
+    流程:
+        1. 从 expand_branches 的每个桥梁实体提取中心事件（锚点）
+        2. 以锚点时间为界，规则拉取该桥梁实体的 10 条历史作为二阶候选
+        3. 将二阶候选与锚点拼接为候选链路，汇总到全局列表
+        4. 一次全局 LLM 筛选，选出 Top-30 条最有价值的链路
+        5. 将选中链路中的二阶尾实体追加到 halt_branches 的对应证据簇中
+
+    参数:
+        halt_branches: 当前已有的暂停分支（高置信度候选实体及证据簇）
+        expand_branches: 需要二阶扩展的桥梁实体及其一阶证据簇
+        entity_search_space: 实体搜索空间
+        query: 查询信息 [subject, relation, target, time]
+        top_n: LLM 筛选保留的最大链路数（默认30）
+
+    返回:
+        (halt_branches, tokens_count, facts_count)
+        - halt_branches: 更新后的暂停分支
+        - tokens_count: LLM 筛选消耗的 Token 数
+        - facts_count: 二阶检索的事实总数
+    """
+    # 没有 expand_branches，直接返回
+    if not expand_branches:
+        return halt_branches, 0, 0
+
+    # 统计变量
+    tokens_count = 0
+    facts_count = 0
+
+    # -------- Step 1 & Step 2: 提取锚点 + 规则拉取二阶候选 --------
+    all_candidate_chains = []  # 全局候选链路列表
+
+    for bridge_entity, first_order_cluster in expand_branches.items():
+        # Step 1: 中心事件 = 已排序一阶簇的第一个元素
+        if not first_order_cluster:
+            continue
+        anchor_quad = first_order_cluster[0]
+        anchor_time = anchor_quad[3]
+
+        # Step 2: 以 anchor_time 为界，拉取桥梁实体在该时间之前的 10 条历史
+        second_order_quads, _ = get_entity_edges_before_time(
+            entity_search_space, bridge_entity, anchor_time, length=10
+        )
+
+        # 统计：累加二阶检索的事实数
+        facts_count += len(second_order_quads)
+
+        # 每条二阶历史与中心事件拼接，形成候选链路
+        for sq in second_order_quads:
+            chain_entry = {
+                "chain": [sq, anchor_quad],       # [二阶事实, 一阶中心事实]
+                "bridge_entity": bridge_entity,    # 所属桥梁实体
+                "second_order_quad": sq,           # 二阶事件本身
+                "tail_entity": sq[2],              # 二阶事实的尾实体 C
+            }
+            all_candidate_chains.append(chain_entry)
+
+    # 没有候选链路，直接返回
+    if not all_candidate_chains:
+        return halt_branches, 0, facts_count
+
+    # -------- Step 3: 全局 LLM 筛选 --------
+    # 如果总数不足 top_n，直接全部保留，无需调用 LLM
+    if len(all_candidate_chains) <= top_n:
+        selected_indices = list(range(len(all_candidate_chains)))
+    else:
+        try:
+            filter_prompt = build_global_chain_filter_prompt(
+                all_candidate_chains, query, top_n
+            )
+            tokens_count += int(len(filter_prompt.split()) * 1.3)
+            llm_output = get_evaluation_results(filter_prompt)
+            selected_indices = parse_global_chain_filter_results(
+                llm_output, len(all_candidate_chains), top_n
+            )
+            # 如果解析结果为空，触发 fallback
+            if not selected_indices:
+                raise ValueError("LLM output parsed to empty ID list")
+        except Exception as e:
+            # Fallback: LLM 筛选失败时按时间倒序保留前 top_n 条
+            print(f"LLM global chain filter failed ({e}), using fallback (top-{top_n} by time).")
+            indexed = list(enumerate(all_candidate_chains))
+            indexed.sort(key=lambda x: x[1]["second_order_quad"][3], reverse=True)
+            selected_indices = [idx for idx, _ in indexed[:top_n]]
+
+    # -------- Step 4: 更新 halt_branches --------
+    for idx in selected_indices:
+        entry = all_candidate_chains[idx]
+        tail_entity_c = entry["tail_entity"]
+        second_quad = entry["second_order_quad"]
+
+        # 将二阶事件追加到 halt_branches 中以尾实体 C 为键的证据簇
+        if tail_entity_c in halt_branches:
+            # 追加并去重
+            existing_set = set(tuple(q) for q in halt_branches[tail_entity_c])
+            if tuple(second_quad) not in existing_set:
+                halt_branches[tail_entity_c].append(second_quad)
+                halt_branches[tail_entity_c].sort(key=lambda x: x[3], reverse=True)
+        else:
+            # 新实体，创建新证据簇
+            halt_branches[tail_entity_c] = [second_quad]
+
+    return halt_branches, tokens_count, facts_count
+
+
+def build_global_chain_filter_prompt(
+    candidate_chains: List[Dict[str, Any]],
+    query: List[Any],
+    top_n: int = 30
+) -> str:
+    """
+    构建全局候选链路筛选 Prompt
+
+    将所有候选链路以带序号的形式展示给 LLM，要求其从中选出
+    对预测目标最有效的 top_n 条链路 ID。
+
+    参数:
+        candidate_chains: 候选链路列表，每项包含 chain / bridge_entity / second_order_quad 等
+        query: 查询信息 [subject, relation, target, time]
+        top_n: 需要保留的链路数量
+
+    返回:
+        格式化的 prompt 字符串
+    """
+    query_subject = query[0]
+    query_relation = query[1]
+    query_time = query[3]
+
+    parts = []
+
+    # 系统角色与任务
+    parts.append("=" * 70 + "\n")
+    parts.append("GLOBAL CANDIDATE CHAIN RANKING (LIGHTWEIGHT SECOND-ORDER FILTER)\n")
+    parts.append("=" * 70 + "\n\n")
+
+    parts.append("You are an expert in Temporal Knowledge Graph (TKG) reasoning. ")
+    parts.append("Your task is to rank and select the most valuable second-order chains ")
+    parts.append("for predicting the target query.\n\n")
+
+    # 查询上下文
+    parts.append("-" * 70 + "\n")
+    parts.append("TARGET QUERY:\n")
+    parts.append("-" * 70 + "\n")
+    parts.append(f"  Predict: ({query_subject}, {query_relation}, ?, on the {query_time}th day)\n\n")
+
+    # 候选链路列表
+    parts.append("-" * 70 + "\n")
+    parts.append(f"CANDIDATE SECOND-ORDER CHAINS (Total: {len(candidate_chains)}):\n")
+    parts.append("-" * 70 + "\n\n")
+
+    for idx, entry in enumerate(candidate_chains, start=1):
+        chain = entry["chain"]
+        # chain[0] = 二阶事件, chain[1] = 一阶中心事件
+        s2, r2, o2, t2 = chain[0]
+        s1, r1, o1, t1 = chain[1]
+        parts.append(f"ID {idx}: [{s2}, {r2}, {o2}, day {t2}] -> [{s1}, {r1}, {o1}, day {t1}]\n")
+
+    parts.append("\n")
+
+    # 筛选指令
+    parts.append("=" * 70 + "\n")
+    parts.append("SELECTION INSTRUCTION:\n")
+    parts.append("=" * 70 + "\n\n")
+    parts.append(f"Select the TOP {top_n} most effective chain IDs for predicting the target query.\n")
+    parts.append("Evaluate based on:\n")
+    parts.append("  1. Causal relevance to the target relation\n")
+    parts.append("  2. Temporal proximity and logical ordering\n")
+    parts.append("  3. Entity/bridge entity connection strength\n\n")
+
+    # 输出格式
+    parts.append("=" * 70 + "\n")
+    parts.append("OUTPUT FORMAT (STRICT):\n")
+    parts.append("=" * 70 + "\n\n")
+    parts.append(f"Output exactly {min(top_n, len(candidate_chains))} chain IDs, one per line:\n\n")
+    parts.append("ID: [number]\n\n")
+    parts.append("Example:\n")
+    parts.append("ID: 3\n")
+    parts.append("ID: 15\n")
+    parts.append("ID: 42\n\n")
+
+    parts.append("IMPORTANT:\n")
+    parts.append("1. Output ONLY the selected IDs\n")
+    parts.append("2. Each ID must be from the candidate list (1 to " + str(len(candidate_chains)) + ")\n")
+    parts.append("3. NO explanations, NO extra text\n\n")
+
+    return ''.join(parts)
+
+
+def parse_global_chain_filter_results(
+    llm_output: str,
+    total_candidates: int,
+    top_n: int
+) -> List[int]:
+    """
+    解析全局链路筛选的 LLM 输出，提取选中的 ID 列表
+
+    参数:
+        llm_output: LLM 返回的原始文本
+        total_candidates: 候选链路总数
+        top_n: 需要保留的最大数量
+
+    返回:
+        选中的 0-based 索引列表（对应 candidate_chains 的下标）
+    """
+    import re
+
+    selected = set()
+
+    if not llm_output or not isinstance(llm_output, str):
+        # Fallback: 返回空列表，让上层走 fallback 逻辑
+        return []
+
+    lines = llm_output.split('\n')
+    for line in lines:
+        line = line.strip()
+        # 匹配 "ID: 3" / "ID:15" / "3" 等格式
+        match = re.search(r'(?:ID\s*[:：]\s*)?(\d+)', line)
+        if match:
+            try:
+                one_based_id = int(match.group(1))
+                if 1 <= one_based_id <= total_candidates:
+                    selected.add(one_based_id - 1)  # 转为 0-based
+            except ValueError:
+                continue
+
+    # 限制数量
+    result = sorted(selected)[:top_n]
+
+    # 如果解析结果为空，返回空列表触发上层 fallback
+    return result

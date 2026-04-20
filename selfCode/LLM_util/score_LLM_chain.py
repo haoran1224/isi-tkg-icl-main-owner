@@ -7,6 +7,7 @@ from selfCode.LLMAPI.qwen_utils import get_evaluation_results
 def prune_relation_set(relation_set, query, chain, top_relation=3):
     # 构建关系剪枝prompt
     prompt = get_prune_relation_prompt(relation_set, query, chain)
+    tokens_count = int(len(prompt.split()) * 1.3)
 
     try:
         # 调用LLM获取关系评分
@@ -17,7 +18,7 @@ def prune_relation_set(relation_set, query, chain, top_relation=3):
         # 如果评分结果为空，返回原始关系集合的前几个
         if not relation_scores:
             pruned_relations = relation_set[:top_relation] if len(relation_set) > top_relation else relation_set
-            return pruned_relations, {}
+            return pruned_relations, {}, tokens_count
 
         # 关联关系和评分
         relation_score_pairs = list(zip(relation_set, relation_scores))
@@ -32,12 +33,12 @@ def prune_relation_set(relation_set, query, chain, top_relation=3):
         pruned_relations = [rel for rel, score in pruned_relations_with_scores]
         relation_scores_dict = {rel: score for rel, score in pruned_relations_with_scores}
 
-        return pruned_relations, relation_scores_dict
+        return pruned_relations, relation_scores_dict, tokens_count
     except Exception as e:
         # 如果发生错误，返回原始关系集合的前几个关系
         print(f"Error in prune_relation_set: {e}")
         pruned_relations = relation_set[:top_relation] if len(relation_set) > top_relation else relation_set
-        return pruned_relations, {}
+        return pruned_relations, {}, tokens_count
 
 # 构建关系剪枝时使用的prompt
 def get_prune_relation_prompt(relation_set, query, chain):

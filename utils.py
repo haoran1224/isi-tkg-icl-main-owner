@@ -533,7 +533,7 @@ def _expand_chains_from_entity(existing_chain, entity_search_space, x, round, ar
 
     # 使用LLM对关系集合进行剪枝，获取关系评分
     top_relation = 5 if round == 0 else 3
-    pruned_relations, relation_scores_dict = prune_relation_set(relation_set, x, existing_chain, top_relation)
+    pruned_relations, relation_scores_dict, _ = prune_relation_set(relation_set, x, existing_chain, top_relation)
 
     if not pruned_relations:
         return {}
@@ -702,7 +702,7 @@ def _process_single_chain(chain_id, chain_data, entity_search_space, x, round):
         return []
 
     # 使用LLM进行关系剪枝
-    pruned_relations, relation_scores_dict = prune_relation_set(last_relation_set, x, chain, top_relation=3)
+    pruned_relations, relation_scores_dict, _ = prune_relation_set(last_relation_set, x, chain, top_relation=3)
 
     if not pruned_relations:
         return []
