@@ -440,3 +440,201 @@ def prune_relation_set_v2(relation_set, query, chain, top_relation=3):
         print(f"Error in prune_relation_set_v2: {e}")
         pruned_relations = relation_set[:top_relation] if len(relation_set) > top_relation else relation_set
         return pruned_relations, {}
+
+
+# ============================================================
+# 扩展实体判断器（$F_{eval}$）- 论文 2.3.3 节实现
+# ============================================================
+
+def get_entity_expansion_prompt(query, local_branches):
+    """
+    构建用于扩展实体判断的 Prompt（批量评估版本）
+
+    功能：设定角色为"时序知识图谱推理专家"，传入目标 Query 和所有候选实体的历史交互事实（证据簇）
+    明确解释 HALT, DISCARD, EXPAND 三种决策的标准，要求 LLM 对每个实体输出决策
+
+    参数:
+        query: 查询四元组 [subject, relation, target, time]
+        local_branches: 候选实体及其证据簇 {entity: [[s, r, o, t], ...]}
+
+    返回:
+        格式化的 prompt 字符串
+    """
+    query_subject = query[0]
+    query_relation = query[1]
+    query_time = query[3]
+
+    parts = []
+
+    # 角色设定
+    parts.append("Role\n\n")
+    parts.append("You are a senior expert in Temporal Knowledge Graph (TKG) reasoning. ")
+    parts.append("Your task is to evaluate ALL candidate entities based on their historical evidence ")
+    parts.append("and determine whether to halt, discard, or expand the search for each candidate.\n\n")
+
+    # 任务定义
+    parts.append("Task Definition\n")
+    parts.append(f"Target Query: Predict which entity will form the relation [{query_relation}] ")
+    parts.append(f"with the subject entity [{query_subject}] at time [{query_time}].\n")
+    parts.append(f"You need to evaluate {len(local_branches)} candidate entities.\n\n")
+
+    # 决策标准（放在前面让模型理解评估标准）
+    parts.append("Decision Criteria (Three Possible Actions):\n\n")
+
+    parts.append("1. HALT (Terminate and Predict):\n")
+    parts.append("   The historical events for this candidate entity already constitute sufficient conditions ")
+    parts.append("   for the target relation to occur. The evidence is strong, logically coherent, and highly relevant. ")
+    parts.append("   No further multi-hop expansion is needed. Keep this candidate for final prediction.\n\n")
+
+    parts.append("2. DISCARD (Prune and Remove):\n")
+    parts.append("   The historical facts are filled with noise, logically inconsistent, or clearly contradictory ")
+    parts.append("   to the target relation. This candidate has very low probability of being the correct answer. ")
+    parts.append("   Remove this candidate from consideration.\n\n")
+
+    parts.append("3. EXPAND (High-Order Expansion):\n")
+    parts.append("   The historical events show logical gaps or missing key contextual information. ")
+    parts.append("   This entity appears to be an intermediate bridge entity that requires multi-hop expansion ")
+    parts.append("   to uncover deeper connections. Trigger subsequent high-order history retrieval for this candidate.\n\n")
+
+    # 展示所有候选实体及其证据簇
+    parts.append("=" * 70 + "\n")
+    parts.append("CANDIDATE ENTITIES AND THEIR HISTORICAL EVIDENCE:\n")
+    parts.append("=" * 70 + "\n\n")
+
+    # 按证据簇大小排序（让模型先看到更重要的候选）
+    sorted_entities = sorted(
+        local_branches.items(),
+        key=lambda x: len(x[1]),
+        reverse=True
+    )
+
+    for idx, (entity, evidence_cluster) in enumerate(sorted_entities, start=1):
+        parts.append(f"[Candidate {idx}: {entity}]\n")
+        parts.append(f"Evidence Cluster ({len(evidence_cluster)} events):\n")
+        for quad in evidence_cluster[:10]:  # 限制每个实体最多显示10条证据
+            s, r, o, t = quad
+            parts.append(f"  {s}, {r}, {o}, on the {t}th day\n")
+        if len(evidence_cluster) > 10:
+            parts.append(f"  ... and {len(evidence_cluster) - 10} more events\n")
+        parts.append("\n")
+
+    # 输出格式要求
+    parts.append("=" * 70 + "\n")
+    parts.append("OUTPUT FORMAT (STRICT):\n")
+    parts.append("=" * 70 + "\n")
+    parts.append("For EACH candidate entity above, output a decision in the following format:\n\n")
+    parts.append("[Entity_Name] | [DECISION]\n\n")
+    parts.append("Where [DECISION] is exactly one of: HALT, DISCARD, EXPAND\n\n")
+
+    parts.append("Example:\n")
+    parts.append("China | HALT\n")
+    parts.append("Germany | DISCARD\n")
+    parts.append("Japan | EXPAND\n")
+    parts.append("France | HALT\n\n")
+
+    parts.append("IMPORTANT:\n")
+    parts.append(f"- You MUST output a decision for ALL {len(local_branches)} candidates\n")
+    parts.append("- Use EXACT entity names from the candidate list above\n")
+    parts.append("- Use EXACTLY 'HALT', 'DISCARD', or 'EXPAND' (uppercase)\n")
+    parts.append("- One entity per line, no additional explanations\n")
+    parts.append("- Evaluate candidates in a globally consistent manner\n")
+
+    return ''.join(parts)
+
+
+def parse_expansion_decision(result_str, candidate_entities):
+    """
+    解析 LLM 返回的批量决策结果
+
+    参数:
+        result_str: LLM 返回的原始字符串
+        candidate_entities: 候选实体列表（用于验证和补全）
+
+    返回:
+        Tuple 包含三个集合:
+        - halt_entities: HALT 实体集合
+        - discard_entities: DISCARD 实体集合
+        - expand_entities: EXPAND 实体集合
+    """
+    halt_entities = set()
+    discard_entities = set()
+    expand_entities = set()
+
+    if not result_str or not isinstance(result_str, str):
+        # 解析失败，所有实体默认为 EXPAND（保证召回率）
+        return halt_entities, discard_entities, set(candidate_entities)
+
+    lines = result_str.split('\n')
+    entity_decisions = {}
+
+    # 解析每一行
+    for line in lines:
+        line = line.strip()
+        if not line or '|' not in line:
+            continue
+
+        parts = line.split('|')
+        if len(parts) != 2:
+            continue
+
+        entity = parts[0].strip()
+        decision = parts[1].strip().upper()
+
+        # 验证决策词的有效性
+        if decision in {'HALT', 'DISCARD', 'EXPAND'}:
+            entity_decisions[entity] = decision
+
+    # 根据解析结果分类实体
+    for entity in candidate_entities:
+        decision = entity_decisions.get(entity, 'EXPAND')  # 未解析到的默认 EXPAND
+
+        if decision == 'HALT':
+            halt_entities.add(entity)
+        elif decision == 'DISCARD':
+            discard_entities.add(entity)
+        elif decision == 'EXPAND':
+            expand_entities.add(entity)
+
+    return halt_entities, discard_entities, expand_entities
+
+
+def evaluate_entity_expansion(query, local_branches):
+    """
+    批量评估所有候选实体（一次 LLM 调用）
+
+    参数:
+        query: 查询四元组 [subject, relation, target, time]
+        local_branches: 格式为 {tail_entity: [[s, r, o, t], ...]}
+
+    返回:
+        Tuple 包含三个集合:
+        - halt_entities: 需要终止预测的实体集合
+        - discard_entities: 需要剪枝丢弃的实体集合
+        - expand_entities: 需要高阶扩展的实体集合
+    """
+    halt_entities = set()
+    discard_entities = set()
+    expand_entities = set()
+
+    if not local_branches:
+        return halt_entities, discard_entities, expand_entities
+
+    try:
+        # 步骤1: 构建批量评估 prompt（包含所有候选实体）
+        prompt = get_entity_expansion_prompt(query, local_branches)
+
+        # 步骤2: 调用 LLM 获取评估结果（仅一次调用）
+        result = get_evaluation_results(prompt)
+
+        # 步骤3: 解析批量决策结果
+        candidate_list = list(local_branches.keys())
+        halt_entities, discard_entities, expand_entities = parse_expansion_decision(
+            result, candidate_list
+        )
+
+    except Exception as e:
+        print(f"Error in evaluate_entity_expansion: {e}")
+        # 发生错误时，所有实体默认为 EXPAND（保证召回率）
+        expand_entities = set(local_branches.keys())
+
+    return halt_entities, discard_entities, expand_entities

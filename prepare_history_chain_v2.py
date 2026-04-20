@@ -8,11 +8,14 @@ import re
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple, Any
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from expand_high_hitory import evaluate_candidate_entities_globally, apply_second_order_expansion
 from selfCode.LLMAPI.qwen_utils import get_evaluation_results
 from selfCode.LLM_util.score_LLM_chain import (
     prune_relation_set, prune_quadruples_score_set,
-    prune_relation_set_v2  # 新增V2版本
+    prune_relation_set_v2,  # V2版本
+    evaluate_entity_expansion  # 扩展实体判断器（$F_{eval}$）
 )
 
 
@@ -574,7 +577,6 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
     )
 
     if not initial_quadruples:
-        # 没有历史数据，返回简单prompt
         prompt = f"No historical data available for {entity}. Query: {entity}, {relation}, ?, {query_time}\n"
         return prompt, []
 
@@ -591,36 +593,25 @@ def prepare_history_chain_v2(x, entity_search_space, args, fileChainName=None,
         pruned_relations = initial_relations[:8]
 
     # ===== 步骤3：根据筛选得到的关系链路筛选四元组 =====
-    # 获取筛选后的关系对应的四元组
     final_quadruples = [
         quad for quad in initial_quadruples
         if quad[1] in pruned_relations
     ]
 
-    # 对每个关系进行四元组筛选
-    # final_quadruples = []
-    # for rel in pruned_relations:
-    #     rel_quads = [quad for quad in filtered_quadruples if quad[1] == rel]
-    #     if rel_quads:
-    #         pruned_quads, _ = prune_quadruples_score_set(
-    #             rel_quads, x, [], rel, top_quadruples=min(3, len(rel_quads))
-    #         )
-    #         final_quadruples.extend(pruned_quads)
-
-    # 如果没有筛选出任何四元组，使用初始四元组的前20个
     if not final_quadruples:
         final_quadruples = initial_quadruples[:20]
 
     # ===== 步骤4：局部分支 - 按尾实体分组形成一阶候选线索 =====
+    # TODO：这一块的构建和排序也是存在一些问题，需要进行一个链路累计的除法
     local_branches = build_local_branch(final_quadruples, relation_scores, query_time)
 
-    # ===== 步骤5：全局分支 - 使用LLM生成宏观状态描述 =====
-    # 获取是否使用LLM生成全局分支的参数
-    # use_llm_global = getattr(args, 'use_llm_global', True)
-    # global_branch = build_global_branch_with_llm(final_quadruples, x, use_llm=use_llm_global)
-
-    # ===== 步骤6：大模型预测 - 融合全局和局部分支，使用思维链推演 =====
-    # 从局部分支中获取候选实体列表，并补充全局历史中的实体
+    halt_branches, expand_branches, discard_entities_global = evaluate_candidate_entities_globally(local_branches, x, 15)
+    #
+    # # ===== 二阶扩展：对expand_branches中的桥梁实体进行高阶历史挖掘 =====
+    halt_branches = apply_second_order_expansion(halt_branches, expand_branches, entity_search_space, x, args, relation_scores)
+    #
+    # # ===== 步骤6：大模型预测 - 融合全局和局部分支，使用思维链推演 =====
+    # candidates = get_candidates_from_local_branches(halt_branches, global_history_quadruples)
     candidates = get_candidates_from_local_branches(local_branches, global_history_quadruples)
 
     # 构建思维链prompt
