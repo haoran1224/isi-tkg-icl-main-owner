@@ -59,7 +59,7 @@ def prepare_history_chain_coh(x, entity_search_space, args):
 
     if not first_order_quads:
         prompt = f"No historical data available for {entity}. Query: {entity}, {relation}, ?, {query_time}\n"
-        return prompt, []
+        return prompt, [], 0, 0
 
     # 调用 LLM 进行一阶筛选
     top_n = 30  # 阶段1筛选数量
